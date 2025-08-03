@@ -1,0 +1,23 @@
+# Ignorar todos los archivos de base de datos SQLite
+*.db
+
+# Ignorar directorios de caché de Python
+__pycache__/
+
+# Ignorar entornos virtuales
+.venv/
+
+# Ignorar el directorio de datos principal
+data/
+
+# Ignorar el directorio de datos de temporadas
+Season/
+
+# Ignorar archivos de datos generados
+seasons_data.json
+
+# Ignorar archivos de log
+*.log
+
+# Ignorar directorios temporales
+tmp/
