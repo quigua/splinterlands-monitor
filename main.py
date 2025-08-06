@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -48,7 +47,7 @@ def compute_signature(string_to_sign, private_key):
     return hex_signature
 
 def login_to_splinterlands(username, posting_key):
-    print("Iniciando login en Splinterlands...")
+    logging.info("Iniciando login en Splinterlands...")
     ts = int(time.time() * 1000)
     message = f"{username}{ts}"
     signature = compute_signature(message, posting_key)
@@ -59,39 +58,74 @@ def login_to_splinterlands(username, posting_key):
         response.raise_for_status()
         login_data = response.json()
         if login_data.get('name') == username and 'token' in login_data:
-            print("Login exitoso.")
+            logging.info("Login exitoso.")
             return login_data['name'], login_data['token']
         else:
-            print("Login fallido. Respuesta inesperada:", login_data)
+            logging.error(f"Login fallido. Respuesta inesperada: {login_data}")
             return None, None
     except requests.exceptions.RequestException as e:
-        print(f"Error durante el proceso de login: {e}")
+        logging.error(f"Error durante el proceso de login: {e}")
         return None, None
 
 def get_player_battle_history(player, auth_user, auth_token):
-    """Obtiene las últimas 50 batallas de un jugador."""
+    """
+    Obtiene las últimas 50 batallas de un jugador, con manejo de límites de tasa.
+    """
     endpoint = f"{API_BASE_URL}/battle/history?player={player}"
     auth_params = {'username': auth_user, 'token': auth_token}
     
-    logging.info(f"Consultando historial para: {player}")
-    try:
-        response = requests.get(endpoint, params=auth_params, timeout=30)
-        response.raise_for_status()
-        # La API puede devolver 'no battles' que no es JSON
-        if not response.text or 'no battles' in response.text:
-            logging.info(f"No se encontraron batallas para {player} en la API.")
-            return []
-        battles_data = response.json().get('battles', [])
-        logging.info(f"API devolvió {len(battles_data)} batallas para {player}.")
-        return battles_data
-    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        logging.error(f"Error al obtener historial de {player}: {e}")
-        return []
+    retries = 0
+    max_retries = 5
+    initial_sleep = 1 # seconds
+    
+    while retries < max_retries:
+        logging.info(f"Consultando historial para: {player} (Intento {retries + 1}/{max_retries})")
+        try:
+            response = requests.get(endpoint, params=auth_params, timeout=30)
+            response.raise_for_status() # Esto lanzará una excepción para códigos de error HTTP (4xx, 5xx)
 
+            # La API puede devolver 'no battles' que no es JSON
+            if not response.text or 'no battles' in response.text:
+                logging.info(f"No se encontraron batallas para {player} en la API.")
+                return []
+            
+            battles_data = response.json().get('battles', [])
+            logging.info(f"API devolvió {len(battles_data)} batallas para {player}.")
+            return battles_data
+
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429: # Too Many Requests
+                retry_after = e.response.headers.get('Retry-After')
+                sleep_time = initial_sleep * (2 ** retries) # Exponential backoff
+                
+                if retry_after:
+                    try:
+                        sleep_time = int(retry_after)
+                    except ValueError:
+                        pass # Fallback to exponential if Retry-After is not a valid int
+                
+                logging.warning(f"Límite de tasa de API alcanzado para {player} (HTTP 429). Esperando {sleep_time:.2f} segundos antes de reintentar.")
+                time.sleep(min(sleep_time, 60)) # Cap sleep time at 60 seconds
+                retries += 1
+            else:
+                logging.error(f"Error HTTP al obtener historial de {player}: {e}")
+                return [] # Other HTTP errors are not retried
+        
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error de conexión al obtener historial de {player}: {e}")
+            # For connection errors, also apply a small backoff before retrying
+            time.sleep(initial_sleep * (2 ** retries))
+            retries += 1
+        
+        except json.JSONDecodeError as e:
+            logging.error(f"Error de decodificación JSON para {player}: {e}. Respuesta: {response.text[:200]}...")
+            return [] # JSON errors are not retried
+
+    logging.error(f"Falló la obtención del historial de {player} después de {max_retries} reintentos debido a límites de tasa o errores de conexión.")
+    return []
 
 
 # --- Lógica Principal del Monitor ---
-
 
 if __name__ == "__main__":
 
@@ -104,13 +138,11 @@ if __name__ == "__main__":
         logging.error("¡Error! Las variables de entorno HIVE_USERNAME y HIVE_POSTING_KEY no están definidas.")
         exit()
 
-    # Autenticación inicial
     user, token = login_to_splinterlands(hive_username, hive_posting_key)
     if not user or not token:
         logging.error("No se pudo iniciar sesión. Abortando.")
         exit()
 
-    # Conectar a la base de datos de jugadores...
     logging.info("Conectando a la base de datos de jugadores...")
     players_db_conn = database.get_players_db_connection()
     if not players_db_conn:
@@ -122,37 +154,35 @@ if __name__ == "__main__":
     database.initialize_players_table(players_db_conn)
     logging.info("Tabla de jugadores inicializada.")
 
-    # Conectar a la base de datos de batallas crudas...
-    logging.info("Conectando a la base de datos de batallas crudas...")
-    raw_battles_db_conn = database.get_raw_battles_db_connection()
-    if not raw_battles_db_conn:
-        logging.error("No se pudo conectar a la base de datos de batallas crudas. Abortando.")
-        exit()
-    logging.info("Base de datos de batallas crudas conectada.")
+    # La conexión a raw_battles_db se gestionará dentro del bucle para liberar el bloqueo más frecuentemente
 
     logging.info("Inicializando tabla de batallas crudas...")
-    database.initialize_raw_battles_table(raw_battles_db_conn)
-    logging.info("Tabla de batallas crudas inicializada.")
-
-    # Conectar a la base de datos de índice de batallas
-    logging.info("Conectando a la base de datos de índice de batallas...")
-    index_conn = database.get_battle_index_connection()
-    if not index_conn:
-        logging.error("No se pudo conectar a la base de datos de índice. Abortando.")
+    # Abrir y cerrar conexión temporal para inicializar la tabla
+    temp_raw_battles_conn = database.get_raw_battles_db_connection()
+    if not temp_raw_battles_conn:
+        logging.error("No se pudo obtener conexión a raw_battles.db para inicializar la tabla. Abortando.")
         exit()
+    try:
+        database.initialize_raw_battles_table(temp_raw_battles_conn)
+        logging.info("Tabla de batallas crudas inicializada.")
+    finally:
+        temp_raw_battles_conn.close()
 
-    # Añadir el usuario inicial si la base de datos de jugadores está vacía
+    # REMOVED: index_conn connection from main.py
+    # logging.info("Conectando a la base de datos de índice de batallas...")
+    # index_conn = database.get_battle_index_connection()
+    # if not index_conn:
+    #     logging.error("No se pudo conectar a la base de datos de índice. Abortando.")
+    #     exit()
+
     if database.get_total_players(players_db_conn) == 0:
         logging.info(f"Base de datos de jugadores vacía. Añadiendo usuario inicial: {hive_username}")
-        database.add_or_update_player(players_db_conn, hive_username)
+        database.add_or_update_players_batch(players_db_conn, [hive_username])
         logging.info(f"Usuario inicial '{hive_username}' añadido a la base de datos de jugadores.")
 
     logging.info(f"Iniciando escaneo con {database.get_total_players(players_db_conn)} jugadores registrados...")
 
-    # Bucle principal del monitor
     while True:
-
-        # 1. Obtener jugadores prioritarios de pending_requests.json
         pending_requests = load_pending_requests()
         priority_players_names = []
         for req in pending_requests:
@@ -165,16 +195,18 @@ if __name__ == "__main__":
             if current_player:
                 logging.info(f"Priorizando escaneo para el jugador: {current_player} (solicitud pendiente).")
 
-        # 2. Si no hay jugadores prioritarios, obtener el siguiente jugador de la cola normal
         if not current_player:
             current_player = database.get_player_to_scan(players_db_conn)
             if not current_player:
                 logging.info("No hay jugadores para escanear que cumplan el criterio de tiempo. Esperando...")
-                time.sleep(60) # Esperar un minuto antes de reintentar
+                time.sleep(0.5)
                 continue
 
         logging.info(f"Procesando jugador: {current_player}")
         battles = get_player_battle_history(current_player, user, token)
+
+        players_to_add_update = set()
+        battles_to_insert = []
 
         if not battles:
             logging.info(f"No se encontraron batallas para {current_player} en la API.")
@@ -187,55 +219,59 @@ if __name__ == "__main__":
                         logging.warning(f"Batalla sin battle_queue_id_1, saltando: {json.dumps(battle)}")
                         continue
 
-                    if database.battle_exists_in_index(index_conn, battle_id):
-                        logging.info(f"Batalla {battle_id} ya existe en el índice, saltando inserción en raw_battles.")
-                        continue
+                    # REMOVED: Check if battle exists in index (this is now process_raw_battles.py's job)
+                    # if database.battle_exists_in_index(index_conn, battle_id):
+                    #     logging.info(f"Batalla {battle_id} ya existe en el índice, saltando inserción en raw_battles.")
+                    #     continue
+                    
+                    battles_to_insert.append(battle)
+                    
+                    # REMOVED: Add battle_id to index (this is now process_raw_battles.py's job)
+                    # database.add_battle_id_to_index(index_conn, battle_id)
 
-                    if database.insert_raw_battle(raw_battles_db_conn, battle):
-                        logging.info(f"Batalla {battle_id} insertada/actualizada exitosamente en raw_battles.")
-                    else:
-                        logging.error(f"Fallo al insertar/actualizar batalla {battle_id} en raw_battles.")
+                    player_1 = battle.get('player_1')
+                    player_2 = battle.get('player_2')
+                    if player_1: players_to_add_update.add(player_1)
+                    if player_2: players_to_add_update.add(player_2)
                 
-                raw_battles_db_conn.commit()
-                logging.info(f"Cambios para {current_player} guardados en raw_battles.db.")
+                if battles_to_insert:
+                    # Abrir conexión a raw_battles.db solo para la inserción
+                    temp_raw_battles_conn = database.get_raw_battles_db_connection()
+                    if temp_raw_battles_conn:
+                        try:
+                            database.insert_raw_battles_batch(temp_raw_battles_conn, battles_to_insert)
+                            logging.info(f"Batch inserted {len(battles_to_insert)} raw battles for {current_player}.")
+                        except Exception as e:
+                            logging.error(f"Error al insertar batallas crudas para {current_player}: {e}")
+                            temp_raw_battles_conn.rollback()
+                        finally:
+                            temp_raw_battles_conn.close()
+                    else:
+                        logging.error(f"No se pudo obtener conexión a raw_battles.db para insertar batallas de {current_player}.")
+                
+                if players_to_add_update:
+                    database.add_or_update_players_batch(players_db_conn, list(players_to_add_update))
+                    logging.info(f"Batch updated {len(players_to_add_update)} players for {current_player}.")
 
             except Exception as e:
                 logging.error(f"Error inesperado al procesar batallas de {current_player}: {e}")
+                players_db_conn.rollback()
 
-            # 5. Añadir jugadores nuevos a la base de datos de jugadores
-            # Esta parte debe estar fuera del try-except del procesamiento de batallas
-            # para que se ejecute incluso si hay errores en la inserción de batallas.
-            for battle in battles: # Re-iterar sobre las batallas para añadir jugadores
-                player_1 = battle.get('player_1')
-                player_2 = battle.get('player_2')
-                
-                if player_1:
-                    database.add_or_update_player(players_db_conn, player_1)
-                if player_2:
-                    database.add_or_update_player(players_db_conn, player_2)
-            
             logging.info(f"Ciclo para {current_player} completado. Total de jugadores registrados: {database.get_total_players(players_db_conn)}")
-            # Pausa entre jugadores para ser amigables con la API
-            time.sleep(5) # Reintroduce a small delay between processing players
+            time.sleep(0.5)
         
-        # Actualizar el timestamp del jugador actual después de escanearlo
-        logging.info(f"Actualizando timestamp para {current_player}...")
-        database.add_or_update_player(players_db_conn, current_player)
+        database.add_or_update_players_batch(players_db_conn, [current_player])
         logging.info(f"Timestamp para {current_player} actualizado.")
 
-        # Si el jugador actual fue un jugador prioritario, actualizar el estado de la solicitud
         if current_player in priority_players_names:
             for req in pending_requests:
                 if req.get('target_username') == current_player and req.get('status') == "DETECTED":
                     req['status'] = "READY_FOR_PROCESSING"
                     save_pending_requests(pending_requests)
                     logging.info(f"Solicitud para {current_player} marcada como READY_FOR_PROCESSING.")
-                    break # Asumimos que solo hay una solicitud DETECTED por jugador prioritario
+                    break
 
-    # Cerrar la conexión a la base de datos de jugadores al finalizar
     logging.info("Cerrando conexión a la base de datos de jugadores...")
     players_db_conn.close()
     logging.info("Conexión a la base de datos de jugadores cerrada.")
-    raw_battles_db_conn.close()
-    logging.info("Conexión a la base de datos de batallas crudas cerrada.")
     logging.info("Proceso de escaneo completado.")

@@ -1,4 +1,3 @@
-
 import os
 import sqlite3
 import glob
@@ -33,6 +32,8 @@ def create_index_db_and_table():
             battle_id TEXT PRIMARY KEY
         )
     ''')
+    # NEW: Clear the table before rebuilding the index
+    cursor.execute("DELETE FROM processed_battles")
     conn.commit()
     return conn
 

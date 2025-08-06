@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from datetime import datetime, timezone
+import sqlite3 # Import sqlite3 directly for batch operations
 
 # Importamos nuestro módulo de base de datos
 import database
@@ -62,20 +63,37 @@ def get_season_id_from_date(battle_date_str, seasons_data):
     basándose en su fecha de creación y los datos de las temporadas.
     """
     try:
-        # Convertir la fecha de la batalla a un objeto datetime con información de zona horaria
-        # Reemplazar 'Z' con '+00:00' para compatibilidad con fromisoformat
         battle_date = datetime.fromisoformat(battle_date_str.replace('Z', '+00:00'))
 
-        # Iterar sobre las temporadas ordenadas para encontrar la correcta
-        for season in seasons_data:
+        # Asegurarse de que las temporadas estén ordenadas por fecha de finalización
+        # Esto ya se hace en load_season_data, pero es una buena práctica asegurarlo aquí también
+        seasons_data.sort(key=lambda x: datetime.fromisoformat(x['ends'].replace('Z', '+00:00')))
+
+        for i, season in enumerate(seasons_data):
             season_end_date = datetime.fromisoformat(season['ends'].replace('Z', '+00:00'))
-            # Si la fecha de la batalla es anterior o igual a la fecha de fin de la temporada,
-            # entonces pertenece a esta temporada.
-            if battle_date <= season_end_date:
+            
+            # La fecha de inicio de la temporada actual es la fecha de fin de la temporada anterior
+            # Para la primera temporada, su inicio es el principio de los tiempos (o un valor muy bajo)
+            if i == 0:
+                season_start_date = datetime.min.replace(tzinfo=battle_date.tzinfo) # Usar el mismo tzinfo
+            else:
+                prev_season_end_date = datetime.fromisoformat(seasons_data[i-1]['ends'].replace('Z', '+00:00'))
+                season_start_date = prev_season_end_date
+            
+            # Una batalla pertenece a una temporada si su fecha está entre el inicio (exclusivo) y el fin (inclusivo) de la temporada
+            # O si es la primera temporada, desde el inicio de los tiempos hasta su fin
+            if season_start_date < battle_date <= season_end_date:
                 return season['id']
         
-        # Si la batalla es posterior a la última temporada conocida
-        logging.warning(f"No se pudo determinar la temporada para la batalla con fecha: {battle_date_str}. Podría ser una temporada futura o datos incompletos.")
+        # Si la batalla es posterior a la última temporada conocida en los datos
+        if battle_date > datetime.fromisoformat(seasons_data[-1]['ends'].replace('Z', '+00:00')):
+            # Podría ser la siguiente temporada o una futura no registrada aún
+            # Para evitar asignar a una temporada muy lejana, podemos devolver None o la última conocida + 1
+            # Por ahora, devolveremos None y un warning, como en la lógica original
+            logging.warning(f"La fecha de batalla {battle_date_str} es posterior a la última temporada registrada. No se pudo determinar la temporada exacta.")
+            return None # O seasons_data[-1]['id'] + 1 si se quiere una aproximación
+
+        logging.warning(f"No se pudo determinar la temporada para la batalla con fecha: {battle_date_str}. Podría ser anterior a la primera temporada registrada.")
         return None
     except ValueError as e:
         logging.error(f"Error al parsear la fecha de la batalla '{battle_date_str}': {e}")
@@ -87,120 +105,119 @@ def process_raw_battles():
 
     raw_battles_conn = database.get_raw_battles_db_connection()
     if not raw_battles_conn:
-        logging.error("No se pudo conectar a la base de datos de batallas crudas. Abortando.")
-        return
+        raise Exception("No se pudo conectar a la base de datos de batallas crudas. Abortando.")
 
     index_conn = database.get_battle_index_connection()
     if not index_conn:
-        logging.error("No se pudo conectar a la base de datos del índice. Abortando.")
         raw_battles_conn.close()
-        return
+        raise Exception("No se pudo conectar a la base de datos del índice. Abortando.")
 
     seasons_data = load_season_data()
     if not seasons_data:
-        logging.error("No se pudieron cargar los datos de las temporadas. Abortando.")
         raw_battles_conn.close()
-        return
+        raise Exception("No se pudieron cargar los datos de las temporadas. Abortando.")
 
     cursor = raw_battles_conn.cursor()
-    # Seleccionar batallas que aún no han sido procesadas
     cursor.execute("SELECT battle_id, battle_data FROM raw_battles")
     battles_to_process = cursor.fetchall()
-    raw_battles_conn.close()
+    raw_battles_conn.close() # Close raw_battles_conn early as we have fetched all data
 
     processed_ids = []
     skipped_count = 0
+    
+    battles_by_db_destination = {}
 
     for battle_id, battle_data_json in battles_to_process:
-        try:
-            battle = json.loads(battle_data_json)
-        except json.JSONDecodeError as e:
-            logging.error(f"Error al decodificar JSON para la batalla {battle_id}: {e}. Datos crudos: {battle_data_json}")
+        battle = json.loads(battle_data_json) # This will raise JSONDecodeError if invalid
+
+        created_date = battle.get('created_date')
+        match_type = battle.get('match_type')
+        game_format = battle.get('format')
+
+        if not created_date:
+            logging.warning(f"Batalla {battle_id} no tiene 'created_date'. Saltando.")
             skipped_count += 1
             continue
-        except Exception as e:
-            logging.error(f"Error inesperado al cargar JSON para la batalla {battle_id}: {e}. Datos crudos: {battle_data_json}")
+
+        season_id = get_season_id_from_date(created_date, seasons_data)
+        if season_id is None:
+            logging.warning(f"No se pudo determinar la temporada para la batalla {battle_id}. Saltando.")
             skipped_count += 1
             continue
+        
+        final_format = determine_battle_format(battle, match_type, game_format)
 
-        try:
-            created_date = battle.get('created_date')
-            match_type = battle.get('match_type')
-            game_format = battle.get('format') # 'format' puede ser 'modern' o 'wild'
+        battle_data_tuple = (
+            battle_id,
+            battle.get('player_1'),
+            battle.get('player_2'),
+            battle.get('winner'),
+            battle.get('loser'),
+            match_type,
+            final_format,
+            battle.get('mana_cap'),
+            battle.get('ruleset'),
+            created_date,
+            battle.get('player_1_rating_initial'),
+            battle.get('player_2_rating_initial'),
+            battle.get('player_1_rating_final'),
+            battle.get('player_2_rating_final'),
+            json.dumps(battle) # Store the original full JSON
+        )
 
-            if not created_date:
-                logging.warning(f"Batalla {battle_id} no tiene 'created_date'. Saltando.")
-                skipped_count += 1
-                continue
+        db_key = (season_id, final_format)
+        if db_key not in battles_by_db_destination:
+            battles_by_db_destination[db_key] = []
+        battles_by_db_destination[db_key].append(battle_data_tuple)
+        
+        processed_ids.append(battle_id)
 
-            season_id = get_season_id_from_date(created_date, seasons_data)
-            if season_id is None:
-                logging.warning(f"No se pudo determinar la temporada para la batalla {battle_id}. Saltando.")
-                skipped_count += 1
-                continue
-            
-            # Determinar el formato final de la batalla
-            final_format = determine_battle_format(battle, match_type, game_format)
+    # --- Batch insert into structured databases ---
+    total_inserted_structured = 0
+    for (season_id, final_format), battles_to_insert_batch in battles_by_db_destination.items():
+        structured_db_conn = database.get_structured_db_connection(season_id, final_format)
+        if not structured_db_conn:
+            raise Exception(f"No se pudo conectar a la DB estructurada para Temporada {season_id}, Formato {final_format}. Abortando.")
+        
+        database.initialize_structured_battle_table(structured_db_conn) # Ensure table exists
+        
+        cursor = structured_db_conn.cursor()
+        cursor.executemany('''
+            INSERT OR IGNORE INTO battles (
+                battle_id, player_1, player_2, winner, loser, match_type, format,
+                mana_cap, ruleset, created_date, player_1_rating_initial,
+                player_2_rating_initial, player_1_rating_final, player_2_rating_final,
+                full_battle_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', battles_to_insert_batch)
+        structured_db_conn.commit() # Commit the batch
+        total_inserted_structured += len(battles_to_insert_batch)
+        logging.info(f"Lote de {len(battles_to_insert_batch)} batallas insertado en T{season_id}, F:{final_format}.")
+        structured_db_conn.close()
 
-            # Preparar datos para la base de datos estructurada
-            battle_data_processed = {
-                'battle_id': battle_id,
-                'player_1': battle.get('player_1'),
-                'player_2': battle.get('player_2'),
-                'winner': battle.get('winner'),
-                'loser': battle.get('loser'),
-                'match_type': match_type,
-                'format': final_format,
-                'mana_cap': battle.get('mana_cap'),
-                'ruleset': battle.get('ruleset'),
-                'created_date': created_date,
-                'player_1_rating_initial': battle.get('player_1_rating_initial'),
-                'player_2_rating_initial': battle.get('player_2_rating_initial'),
-                'player_1_rating_final': battle.get('player_1_rating_final'),
-                'player_2_rating_final': battle.get('player_2_rating_final'),
-                'original_json_data': battle # Añadir el JSON original completo
-            }
-
-            # Conectar e inicializar la base de datos estructurada para esta batalla
-            structured_db_conn = database.get_structured_db_connection(season_id, final_format)
-            if not structured_db_conn:
-                logging.error(f"No se pudo conectar a la DB estructurada para Temporada {season_id}, Formato {final_format}. Saltando batalla {battle_id}.")
-                skipped_count += 1
-                continue
-            
-            database.initialize_structured_battle_table(structured_db_conn)
-
-            # Insertar la batalla procesada
-            if database.insert_processed_battle(structured_db_conn, battle_data_processed):
-                logging.info(f"Batalla {battle_id} (T{season_id}, F:{final_format}) procesada y guardada.")
-                # Añadir al nuevo índice centralizado
-                database.add_battle_id_to_index(index_conn, battle_id)
-                processed_ids.append(battle_id)
-            else:
-                logging.error(f"Fallo al insertar batalla {battle_id} en la DB estructurada.")
-                skipped_count += 1
-            
-            structured_db_conn.close()
-
-        except Exception as e:
-            logging.error(f"Error inesperado al procesar la batalla {battle_id}: {e}")
-            skipped_count += 1
-
-    # Eliminar las batallas procesadas de raw_battles.db
+    # --- Batch insert into battle index ---
     if processed_ids:
-        raw_battles_conn = database.get_raw_battles_db_connection()
-        if raw_battles_conn:
-            try:
-                cursor = raw_battles_conn.cursor()
-                cursor.executemany("DELETE FROM raw_battles WHERE battle_id = ?", [(pid,) for pid in processed_ids])
-                raw_battles_conn.commit()
-                logging.info(f"{len(processed_ids)} batallas procesadas eliminadas de raw_battles.db.")
-            except sqlite3.Error as e:
-                logging.error(f"Error al eliminar batallas procesadas de raw_battles.db: {e}")
-            finally:
-                raw_battles_conn.close()
+        cursor = index_conn.cursor()
+        cursor.executemany("INSERT OR IGNORE INTO processed_battles (battle_id) VALUES (?)", [(pid,) for pid in processed_ids])
+        index_conn.commit() # Commit the index batch
+        logging.info(f"Lote de {len(processed_ids)} IDs de batalla insertado en el índice.")
+    
+    index_conn.close() # Close index connection after all operations
 
-    logging.info(f"Procesador de batallas crudas finalizado. Procesadas: {len(processed_ids)}, Saltadas: {skipped_count}.")
+    # --- Delete processed battles from raw_battles.db (only if structured and index commits were successful) ---
+    if processed_ids and total_inserted_structured == len(processed_ids): # Ensure all were inserted
+        raw_battles_conn_for_delete = database.get_raw_battles_db_connection()
+        if raw_battles_conn_for_delete:
+            cursor = raw_battles_conn_for_delete.cursor()
+            cursor.executemany("DELETE FROM raw_battles WHERE battle_id = ?", [(pid,) for pid in processed_ids])
+            raw_battles_conn_for_delete.commit()
+            logging.info(f"{len(processed_ids)} batallas procesadas eliminadas de raw_battles.db.")
+            raw_battles_conn_for_delete.close()
+    else:
+        logging.warning("No se eliminaron batallas de raw_battles.db porque no todas se insertaron correctamente en las DBs estructuradas o el índice.")
+
+    logging.info(f"Procesador de batallas crudas finalizado. Procesadas (intentadas): {len(battles_to_process)}, Insertadas en estructuradas: {total_inserted_structured}, Saltadas: {skipped_count}.")
 
 if __name__ == "__main__":
     process_raw_battles()
