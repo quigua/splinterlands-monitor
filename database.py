@@ -35,7 +35,7 @@ def get_structured_db_connection(season, match_type):
     db_path = os.path.join(STRUCTURED_BATTLES_ROOT, str(season), f'{match_type}.db')
     if not os.path.exists(os.path.dirname(db_path)):
         os.makedirs(os.path.dirname(db_path))
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10) # Añadido timeout de 10 segundos
     conn.execute('PRAGMA journal_mode=WAL') # Habilitar WAL para concurrencia
     return conn
 
