@@ -15,7 +15,7 @@ STRUCTURED_BATTLES_ROOT = os.path.join(PROJECT_ROOT, 'Season')
 STRUCTURED_BATTLES_DB_PATTERN = os.path.join(STRUCTURED_BATTLES_ROOT, '*', '*', '*.db')
 
 def get_raw_battles_db_connection():
-    conn = sqlite3.connect(os.path.join(DB_FOLDER, 'raw_battles.db'))
+    conn = sqlite3.connect(os.path.join(DB_FOLDER, 'raw_battles.db'), timeout=10) # Timeout de 10 segundos
     conn.execute('PRAGMA journal_mode=WAL') # Habilitar WAL para concurrencia
     return conn
 

@@ -143,135 +143,111 @@ if __name__ == "__main__":
         logging.error("No se pudo iniciar sesión. Abortando.")
         exit()
 
-    logging.info("Conectando a la base de datos de jugadores...")
-    players_db_conn = database.get_players_db_connection()
-    if not players_db_conn:
-        logging.error("No se pudo conectar a la base de datos de jugadores. Abortando.")
-        exit()
-    logging.info("Base de datos de jugadores conectada.")
-
-    logging.info("Inicializando tabla de jugadores...")
-    database.initialize_players_table(players_db_conn)
-    logging.info("Tabla de jugadores inicializada.")
-
-    # La conexión a raw_battles_db se gestionará dentro del bucle para liberar el bloqueo más frecuentemente
-
-    logging.info("Inicializando tabla de batallas crudas...")
-    # Abrir y cerrar conexión temporal para inicializar la tabla
-    temp_raw_battles_conn = database.get_raw_battles_db_connection()
-    if not temp_raw_battles_conn:
-        logging.error("No se pudo obtener conexión a raw_battles.db para inicializar la tabla. Abortando.")
-        exit()
+    # --- NUEVO: Inicialización de Conexiones ---
+    players_db_conn = None
+    raw_battles_conn = None
     try:
-        database.initialize_raw_battles_table(temp_raw_battles_conn)
-        logging.info("Tabla de batallas crudas inicializada.")
-    finally:
-        temp_raw_battles_conn.close()
+        logging.info("Conectando a la base de datos de jugadores...")
+        players_db_conn = database.get_players_db_connection()
+        if not players_db_conn:
+            logging.error("No se pudo conectar a la base de datos de jugadores. Abortando.")
+            exit()
+        logging.info("Base de datos de jugadores conectada.")
 
-    # REMOVED: index_conn connection from main.py
-    # logging.info("Conectando a la base de datos de índice de batallas...")
-    # index_conn = database.get_battle_index_connection()
-    # if not index_conn:
-    #     logging.error("No se pudo conectar a la base de datos de índice. Abortando.")
-    #     exit()
+        logging.info("Conectando a la base de datos de batallas crudas...")
+        raw_battles_conn = database.get_raw_battles_db_connection()
+        if not raw_battles_conn:
+            logging.error("No se pudo conectar a la base de datos de batallas crudas. Abortando.")
+            exit()
+        logging.info("Base de datos de batallas crudas conectada.")
 
-    if database.get_total_players(players_db_conn) == 0:
-        logging.info(f"Base de datos de jugadores vacía. Añadiendo usuario inicial: {hive_username}")
-        database.add_or_update_players_batch(players_db_conn, [hive_username])
-        logging.info(f"Usuario inicial '{hive_username}' añadido a la base de datos de jugadores.")
+        logging.info("Inicializando tablas...")
+        database.initialize_players_table(players_db_conn)
+        database.initialize_raw_battles_table(raw_battles_conn)
+        logging.info("Tablas inicializadas.")
 
-    logging.info(f"Iniciando escaneo con {database.get_total_players(players_db_conn)} jugadores registrados...")
+        if database.get_total_players(players_db_conn) == 0:
+            logging.info(f"Base de datos de jugadores vacía. Añadiendo usuario inicial: {hive_username}")
+            database.add_or_update_players_batch(players_db_conn, [hive_username])
+            logging.info(f"Usuario inicial '{hive_username}' añadido a la base de datos de jugadores.")
 
-    while True:
-        pending_requests = load_pending_requests()
-        priority_players_names = []
-        for req in pending_requests:
-            if req.get('status') == "DETECTED" and req.get('target_username'):
-                priority_players_names.append(req['target_username'])
-        
-        current_player = None
-        if priority_players_names:
-            current_player = database.get_priority_player_to_scan(players_db_conn, priority_players_names)
-            if current_player:
-                logging.info(f"Priorizando escaneo para el jugador: {current_player} (solicitud pendiente).")
+        logging.info(f"Iniciando escaneo con {database.get_total_players(players_db_conn)} jugadores registrados...")
 
-        if not current_player:
-            current_player = database.get_player_to_scan(players_db_conn)
+        # --- Bucle Principal ---
+        while True:
+            pending_requests = load_pending_requests()
+            priority_players_names = [req['target_username'] for req in pending_requests if req.get('status') == "DETECTED" and req.get('target_username')]
+            
+            current_player = None
+            if priority_players_names:
+                current_player = database.get_priority_player_to_scan(players_db_conn, priority_players_names)
+                if current_player:
+                    logging.info(f"Priorizando escaneo para el jugador: {current_player} (solicitud pendiente).")
+
             if not current_player:
-                logging.info("No hay jugadores para escanear que cumplan el criterio de tiempo. Esperando...")
-                time.sleep(0.5)
-                continue
+                current_player = database.get_player_to_scan(players_db_conn)
+                if not current_player:
+                    logging.info("No hay jugadores para escanear que cumplan el criterio de tiempo. Esperando...")
+                    time.sleep(0.5)
+                    continue
 
-        logging.info(f"Procesando jugador: {current_player}")
-        battles = get_player_battle_history(current_player, user, token)
+            logging.info(f"Procesando jugador: {current_player}")
+            battles = get_player_battle_history(current_player, user, token)
 
-        players_to_add_update = set()
-        battles_to_insert = []
+            if not battles:
+                logging.info(f"No se encontraron batallas para {current_player} en la API.")
+            else:
+                logging.info(f"Procesando {len(battles)} batallas de {current_player}...")
+                players_to_add_update = set()
+                battles_to_insert = []
 
-        if not battles:
-            logging.info(f"No se encontraron batallas para {current_player} en la API.")
-        else:
-            logging.info(f"Procesando {len(battles)} batallas de {current_player}...")
-            try:
                 for battle in battles:
                     battle_id = battle.get('battle_queue_id_1')
                     if not battle_id:
                         logging.warning(f"Batalla sin battle_queue_id_1, saltando: {json.dumps(battle)}")
                         continue
-
-                    # REMOVED: Check if battle exists in index (this is now process_raw_battles.py's job)
-                    # if database.battle_exists_in_index(index_conn, battle_id):
-                    #     logging.info(f"Batalla {battle_id} ya existe en el índice, saltando inserción en raw_battles.")
-                    #     continue
                     
                     battles_to_insert.append(battle)
                     
-                    # REMOVED: Add battle_id to index (this is now process_raw_battles.py's job)
-                    # database.add_battle_id_to_index(index_conn, battle_id)
-
                     player_1 = battle.get('player_1')
                     player_2 = battle.get('player_2')
                     if player_1: players_to_add_update.add(player_1)
                     if player_2: players_to_add_update.add(player_2)
                 
                 if battles_to_insert:
-                    # Abrir conexión a raw_battles.db solo para la inserción
-                    temp_raw_battles_conn = database.get_raw_battles_db_connection()
-                    if temp_raw_battles_conn:
-                        try:
-                            database.insert_raw_battles_batch(temp_raw_battles_conn, battles_to_insert)
-                            logging.info(f"Batch inserted {len(battles_to_insert)} raw battles for {current_player}.")
-                        except Exception as e:
-                            logging.error(f"Error al insertar batallas crudas para {current_player}: {e}")
-                            temp_raw_battles_conn.rollback()
-                        finally:
-                            temp_raw_battles_conn.close()
-                    else:
-                        logging.error(f"No se pudo obtener conexión a raw_battles.db para insertar batallas de {current_player}.")
+                    # --- MODIFICADO: Usar la conexión existente ---
+                    database.insert_raw_battles_batch(raw_battles_conn, battles_to_insert)
+                    logging.info(f"Batch inserted {len(battles_to_insert)} raw battles for {current_player}.")
                 
                 if players_to_add_update:
                     database.add_or_update_players_batch(players_db_conn, list(players_to_add_update))
                     logging.info(f"Batch updated {len(players_to_add_update)} players for {current_player}.")
 
-            except Exception as e:
-                logging.error(f"Error inesperado al procesar batallas de {current_player}: {e}")
-                players_db_conn.rollback()
-
             logging.info(f"Ciclo para {current_player} completado. Total de jugadores registrados: {database.get_total_players(players_db_conn)}")
+            database.add_or_update_players_batch(players_db_conn, [current_player])
+            logging.info(f"Timestamp para {current_player} actualizado.")
+
+            if current_player in priority_players_names:
+                for req in pending_requests:
+                    if req.get('target_username') == current_player and req.get('status') == "DETECTED":
+                        req['status'] = "READY_FOR_PROCESSING"
+                        save_pending_requests(pending_requests)
+                        logging.info(f"Solicitud para {current_player} marcada como READY_FOR_PROCESSING.")
+                        break
+            
             time.sleep(0.5)
-        
-        database.add_or_update_players_batch(players_db_conn, [current_player])
-        logging.info(f"Timestamp para {current_player} actualizado.")
 
-        if current_player in priority_players_names:
-            for req in pending_requests:
-                if req.get('target_username') == current_player and req.get('status') == "DETECTED":
-                    req['status'] = "READY_FOR_PROCESSING"
-                    save_pending_requests(pending_requests)
-                    logging.info(f"Solicitud para {current_player} marcada como READY_FOR_PROCESSING.")
-                    break
-
-    logging.info("Cerrando conexión a la base de datos de jugadores...")
-    players_db_conn.close()
-    logging.info("Conexión a la base de datos de jugadores cerrada.")
-    logging.info("Proceso de escaneo completado.")
+    except KeyboardInterrupt:
+        logging.info("Proceso interrumpido por el usuario.")
+    except Exception as e:
+        logging.error(f"Error inesperado en el bucle principal: {e}", exc_info=True)
+    finally:
+        # --- NUEVO: Cierre Seguro de Conexiones ---
+        logging.info("Cerrando conexiones a la base de datos...")
+        if players_db_conn:
+            players_db_conn.close()
+            logging.info("Conexión a la base de datos de jugadores cerrada.")
+        if raw_battles_conn:
+            raw_battles_conn.close()
+            logging.info("Conexión a la base de datos de batallas crudas cerrada.")
+        logging.info("Proceso de escaneo completado.")
